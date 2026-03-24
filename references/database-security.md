@@ -621,6 +621,482 @@ $$ LANGUAGE plpgsql;
 SELECT cron.schedule('cleanup-audit-logs', '0 2 * * *', 'SELECT delete_old_audit_logs()');
 ```
 
+## Quick Fix Patterns
+
+### Pattern 1: RLS Disabled → Enable RLS with Policies
+
+**Detection**: Check Supabase tables for missing `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`
+
+**Fix (diff format)**:
+```diff
++ -- Enable RLS on the table
++ ALTER TABLE users ENABLE ROW LEVEL SECURITY;
++ 
++ -- Add policy for users to read their own data
++ CREATE POLICY "users_select_own" ON users
++   FOR SELECT
++   USING (auth.uid() = id);
++ 
++ -- Add policy for users to update their own data
++ CREATE POLICY "users_update_own" ON users
++   FOR UPDATE
++   USING (auth.uid() = id)
++   WITH CHECK (auth.uid() = id);
+```
+
+**Manual steps**:
+1. Run `ALTER TABLE <table_name> ENABLE ROW LEVEL SECURITY;` for each table
+2. Create SELECT policy: `CREATE POLICY "select_own" ON <table> FOR SELECT USING (auth.uid() = user_id);`
+3. Create INSERT policy with WITH CHECK clause
+4. Create UPDATE policy with both USING and WITH CHECK
+5. Create DELETE policy if needed
+6. Test with authenticated user to verify access control works
+7. Test with different user to verify they can't access other users' data
+
+### Pattern 2: Service Role in Client → Move to Server
+
+**Detection**: Search for `NEXT_PUBLIC_SUPABASE_SERVICE`, `VITE_SUPABASE_SERVICE`, service role key in client code
+
+**Fix (diff format)**:
+```diff
+# .env
+- NEXT_PUBLIC_SUPABASE_KEY=eyJhbGc...service_role...
++ NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJhbGc...anon...
++ SUPABASE_SERVICE_ROLE_KEY=eyJhbGc...service_role...
+```
+
+```diff
+// lib/supabase.js (client-side)
+- const supabase = createClient(url, process.env.NEXT_PUBLIC_SUPABASE_SERVICE_KEY);
++ const supabase = createClient(url, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY);
+```
+
+```diff
+// pages/api/admin.js (NEW FILE - server-side only)
++ import { createClient } from '@supabase/supabase-js';
++ 
++ const supabaseAdmin = createClient(
++   process.env.SUPABASE_URL,
++   process.env.SUPABASE_SERVICE_ROLE_KEY
++ );
++ 
++ export default async function handler(req, res) {
++   // Verify admin authentication first
++   const { data } = await supabaseAdmin.from('users').select('*');
++   res.json(data);
++ }
+```
+
+**Manual steps**:
+1. Remove service role key from all client-side environment variables
+2. Add service role key to server-side environment variables only
+3. Replace client-side service role usage with anon key
+4. Create API routes for operations that need service role
+5. Add authentication/authorization checks in API routes
+6. Rotate the exposed service role key in Supabase dashboard
+7. Test that client can no longer bypass RLS
+8. Rebuild and redeploy to remove key from client bundle
+
+### Pattern 3: SQL Injection → Parameterized Query
+
+**Detection**: Search for f-strings, string concatenation, or `.format()` in SQL queries
+
+**Fix (diff format)**:
+```diff
+- query = f"SELECT * FROM users WHERE username = '{username}'"
+- result = db.execute(query)
++ query = "SELECT * FROM users WHERE username = ?"
++ result = db.execute(query, (username,))
+```
+
+```diff
+# SQLAlchemy
+- from sqlalchemy import text
+- query = text(f"SELECT * FROM users WHERE username = '{username}'")
++ query = text("SELECT * FROM users WHERE username = :username")
++ result = db.session.execute(query, {"username": username})
+
+# Or use ORM (preferred)
++ from sqlalchemy import select
++ stmt = select(User).where(User.username == username)
++ result = db.session.execute(stmt).scalar_one_or_none()
+```
+
+**Manual steps**:
+1. Find all SQL queries using string interpolation
+2. Replace with parameterized queries using `?` or `:param` placeholders
+3. Pass parameters as separate arguments to execute()
+4. For ORMs, use query builder methods instead of raw SQL
+5. Test with malicious input: `username = "admin' OR '1'='1"`
+6. Verify query fails safely instead of returning unauthorized data
+
+### Pattern 4: No Transaction Lock → SELECT FOR UPDATE
+
+**Detection**: Critical operations (balance updates, stock management) without row locking
+
+**Fix (diff format)**:
+```diff
+  def transfer_funds(from_user_id, to_user_id, amount):
+-     from_user = db.query(User).get(from_user_id)
+-     to_user = db.query(User).get(to_user_id)
++     with db.begin():
++         from_user = db.session.execute(
++             select(User).where(User.id == from_user_id).with_for_update()
++         ).scalar_one()
++         
++         to_user = db.session.execute(
++             select(User).where(User.id == to_user_id).with_for_update()
++         ).scalar_one()
+          
+          if from_user.balance >= amount:
+              from_user.balance -= amount
+              to_user.balance += amount
+-             db.commit()
+```
+
+**Manual steps**:
+1. Identify critical operations that modify financial data or inventory
+2. Wrap in transaction: `with db.begin():`
+3. Add `.with_for_update()` to SELECT queries
+4. Ensure transaction commits only after all checks pass
+5. Test with concurrent requests to verify no race conditions
+6. Monitor for deadlocks and adjust lock order if needed
+
+## Framework-Specific Guidance
+
+### Supabase (RLS Policies, anon vs service key)
+
+**RLS Policy Patterns**:
+```sql
+-- Pattern 1: User owns the row (user_id column)
+CREATE POLICY "users_own_data" ON table_name
+  FOR ALL
+  USING (auth.uid() = user_id)
+  WITH CHECK (auth.uid() = user_id);
+
+-- Pattern 2: Public read, authenticated write
+CREATE POLICY "public_read" ON table_name
+  FOR SELECT
+  USING (true);
+
+CREATE POLICY "authenticated_write" ON table_name
+  FOR INSERT
+  WITH CHECK (auth.role() = 'authenticated');
+
+-- Pattern 3: Role-based access
+CREATE POLICY "admin_all_access" ON table_name
+  FOR ALL
+  USING (
+    EXISTS (
+      SELECT 1 FROM user_roles
+      WHERE user_id = auth.uid() AND role = 'admin'
+    )
+  );
+
+-- Pattern 4: Relationship-based access (e.g., team members)
+CREATE POLICY "team_members_access" ON projects
+  FOR ALL
+  USING (
+    EXISTS (
+      SELECT 1 FROM team_members
+      WHERE team_id = projects.team_id
+      AND user_id = auth.uid()
+    )
+  );
+
+-- Pattern 5: Time-based access
+CREATE POLICY "active_subscriptions" ON premium_content
+  FOR SELECT
+  USING (
+    EXISTS (
+      SELECT 1 FROM subscriptions
+      WHERE user_id = auth.uid()
+      AND expires_at > NOW()
+    )
+  );
+```
+
+**Client vs Server Usage**:
+```typescript
+// Client-side (uses anon key, respects RLS)
+import { createClient } from '@supabase/supabase-js';
+
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+);
+
+// User can only access their own data
+const { data } = await supabase
+  .from('users')
+  .select('*')
+  .eq('id', user.id);
+
+// Server-side admin operations (bypasses RLS)
+// pages/api/admin/users.ts
+import { createClient } from '@supabase/supabase-js';
+
+const supabaseAdmin = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!
+);
+
+export default async function handler(req, res) {
+  // CRITICAL: Verify admin authentication first
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  const { data: { user } } = await supabase.auth.getUser(token);
+  
+  if (!user || !await isAdmin(user.id)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  
+  // Now safe to use admin client
+  const { data } = await supabaseAdmin.from('users').select('*');
+  res.json(data);
+}
+```
+
+### Firebase (Security Rules)
+
+**Firestore Security Rules Patterns**:
+```javascript
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function isAdmin() {
+      return isAuthenticated() && 
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+    
+    // Users collection
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isAdmin();
+      allow create: if isAuthenticated() && isOwner(userId);
+      allow update: if isOwner(userId);
+      allow delete: if isAdmin();
+      
+      // Prevent modification of sensitive fields
+      allow update: if isOwner(userId) && 
+                      !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'balance']);
+    }
+    
+    // Orders collection
+    match /orders/{orderId} {
+      allow read: if isAuthenticated() && 
+                    resource.data.userId == request.auth.uid;
+      allow create: if isAuthenticated() && 
+                      request.resource.data.userId == request.auth.uid &&
+                      request.resource.data.status == 'pending';
+      // Only server can update order status
+      allow update: if false;
+      allow delete: if false;
+    }
+    
+    // Public content
+    match /posts/{postId} {
+      allow read: if true;
+      allow create: if isAuthenticated();
+      allow update, delete: if isAuthenticated() && 
+                              resource.data.authorId == request.auth.uid;
+    }
+  }
+}
+```
+
+### Prisma (Row-level security, middleware)
+
+**Prisma Middleware for RLS**:
+```typescript
+// lib/prisma.ts
+import { PrismaClient } from '@prisma/client';
+
+const prisma = new PrismaClient();
+
+// Middleware to enforce row-level security
+prisma.$use(async (params, next) => {
+  // Get current user from context (set by auth middleware)
+  const userId = (params as any).userId;
+  
+  if (!userId) {
+    throw new Error('User not authenticated');
+  }
+  
+  // Automatically filter queries by user_id
+  if (params.model === 'User') {
+    if (params.action === 'findMany' || params.action === 'findFirst') {
+      params.args.where = {
+        ...params.args.where,
+        id: userId,
+      };
+    }
+    
+    if (params.action === 'update' || params.action === 'delete') {
+      params.args.where = {
+        ...params.args.where,
+        id: userId,
+      };
+    }
+  }
+  
+  if (params.model === 'Order') {
+    if (params.action === 'findMany' || params.action === 'findFirst') {
+      params.args.where = {
+        ...params.args.where,
+        userId: userId,
+      };
+    }
+  }
+  
+  return next(params);
+});
+
+export default prisma;
+```
+
+**Transaction with Locking**:
+```typescript
+// Transfer funds with row locking
+async function transferFunds(fromUserId: string, toUserId: string, amount: number) {
+  return await prisma.$transaction(async (tx) => {
+    // Lock rows for update (PostgreSQL)
+    const fromUser = await tx.$queryRaw`
+      SELECT * FROM "User" WHERE id = ${fromUserId} FOR UPDATE
+    `;
+    
+    const toUser = await tx.$queryRaw`
+      SELECT * FROM "User" WHERE id = ${toUserId} FOR UPDATE
+    `;
+    
+    if (fromUser[0].balance < amount) {
+      throw new Error('Insufficient funds');
+    }
+    
+    await tx.user.update({
+      where: { id: fromUserId },
+      data: { balance: { decrement: amount } },
+    });
+    
+    await tx.user.update({
+      where: { id: toUserId },
+      data: { balance: { increment: amount } },
+    });
+  }, {
+    isolationLevel: 'Serializable', // Highest isolation level
+  });
+}
+```
+
+### SQLAlchemy (ORM patterns, transactions)
+
+**Query Patterns**:
+```python
+from sqlalchemy import select, and_, or_
+from sqlalchemy.orm import Session
+
+# Pattern 1: Basic query with filter
+def get_user_orders(db: Session, user_id: int):
+    stmt = select(Order).where(Order.user_id == user_id)
+    return db.execute(stmt).scalars().all()
+
+# Pattern 2: Join with filter
+def get_orders_with_products(db: Session, user_id: int):
+    stmt = (
+        select(Order, Product)
+        .join(Product, Order.product_id == Product.id)
+        .where(Order.user_id == user_id)
+    )
+    return db.execute(stmt).all()
+
+# Pattern 3: Complex filter
+def get_active_premium_users(db: Session):
+    stmt = select(User).where(
+        and_(
+            User.subscription_status == 'active',
+            User.subscription_expires > datetime.utcnow(),
+            or_(
+                User.plan == 'premium',
+                User.plan == 'enterprise'
+            )
+        )
+    )
+    return db.execute(stmt).scalars().all()
+
+# Pattern 4: Aggregation
+from sqlalchemy import func
+
+def get_user_order_total(db: Session, user_id: int):
+    stmt = (
+        select(func.sum(Order.amount))
+        .where(Order.user_id == user_id)
+    )
+    return db.execute(stmt).scalar()
+```
+
+**Transaction Patterns**:
+```python
+from sqlalchemy.orm import Session
+from contextlib import contextmanager
+
+@contextmanager
+def transaction(db: Session):
+    """Context manager for database transactions"""
+    try:
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+# Usage
+def create_order_with_items(db: Session, user_id: int, items: list):
+    with transaction(db):
+        # Create order
+        order = Order(user_id=user_id, total=0)
+        db.add(order)
+        db.flush()  # Get order.id without committing
+        
+        # Create order items
+        total = 0
+        for item in items:
+            order_item = OrderItem(
+                order_id=order.id,
+                product_id=item['product_id'],
+                quantity=item['quantity'],
+                price=item['price']
+            )
+            db.add(order_item)
+            total += item['price'] * item['quantity']
+        
+        # Update order total
+        order.total = total
+        # Commit happens in context manager
+
+# Row locking pattern
+def update_product_stock(db: Session, product_id: int, quantity: int):
+    with transaction(db):
+        # Lock row for update
+        product = db.execute(
+            select(Product)
+            .where(Product.id == product_id)
+            .with_for_update()
+        ).scalar_one()
+        
+        if product.stock < quantity:
+            raise ValueError('Insufficient stock')
+        
+        product.stock -= quantity
+```
+
 ## Detection Checklist
 
 - [ ] RLS is enabled on all Supabase tables

@@ -1,6 +1,6 @@
 ---
 name: vibe-security-enhanced
-description: Comprehensive security audit system for AI-generated codebases across all application types. Detects exposed secrets, broken access control, authentication bypasses, injection vulnerabilities, race conditions, financial logic flaws, ML security issues, API vulnerabilities, and deployment misconfigurations. Covers web apps, mobile apps, trading systems, ML pipelines, APIs, and microservices. Triggers on security keywords, code reviews, or when handling authentication, payments, databases, APIs, secrets, user data, financial operations, ML models, or sensitive business logic. Use for security audits, code reviews, vulnerability assessments, or proactive secure code generation.
+description: Comprehensive security audit system for AI-generated codebases across all application types. Detects exposed secrets, broken access control, authentication bypasses, injection vulnerabilities, race conditions, financial logic flaws, ML security issues, API vulnerabilities, deployment misconfigurations, insecure defaults, supply chain risks, and API footguns. Covers web apps, mobile apps, trading systems, ML pipelines, APIs, and microservices. Triggers on security keywords, code reviews, or when handling authentication, payments, databases, APIs, secrets, user data, financial operations, ML models, or sensitive business logic. Use for security audits, code reviews, vulnerability assessments, or proactive secure code generation.
 license: MIT
 metadata:
   author: Enhanced by Kiro AI based on Chris Raroque's vibe-security
@@ -82,6 +82,12 @@ Examine the codebase systematically. For each category, load the relevant refere
 
 22. **Disaster Recovery & Resilience** — Check backup security (encryption, access control), recovery procedures, kill switch implementation, circuit breakers, graceful degradation, and data corruption detection. See `references/disaster-recovery.md`.
 
+23. **Insecure Defaults & Fail-Open Patterns** — Detect configurations where missing or empty values cause the application to run insecurely rather than fail safely. Check for fallback secrets (`SECRET = env.get('KEY') or 'default'`), fail-open auth flags (`AUTH_REQUIRED = env.get('X', 'false')`), zero-value bypasses (e.g., `lifetime=0` disabling expiry), and hardcoded weak defaults. Distinguish fail-open (exploitable) from fail-secure (crashes safely). See `references/insecure-defaults.md`.
+
+24. **Supply Chain & Dependency Risk** — Assess dependency health beyond known CVEs. Flag packages with a single anonymous maintainer, no security contact, long periods of inactivity, a high CVE count relative to popularity, or use of high-risk features (FFI, deserialization, third-party code execution). Check for unpinned dependencies and typosquatting risks. See `references/dependencies.md`.
+
+25. **API & Library Sharp Edges** — Identify APIs and configurations where the easy path leads to insecurity. Check for algorithm/mode selection footguns (e.g., JWT `alg: none`, accepting any cipher string), dangerous defaults where zero/empty/null disables security, primitive APIs that expose raw bytes instead of typed abstractions, and configuration options that silently disable security controls. The secure usage should be the path of least resistance. See `references/sharp-edges.md`.
+
 ## Core Instructions
 
 - **Report only genuine security issues** - Do not nitpick style, performance, or non-security concerns unless they have direct security implications.
@@ -114,6 +120,63 @@ Organize findings by severity: **Critical** → **High** → **Medium** → **Lo
 - **Low**: Difficult to exploit or minimal impact (verbose errors, missing security headers)
 - **Informational**: Security best practices, defense-in-depth improvements, no immediate risk
 
+### Risk Score Calculation
+
+Each finding receives a quantitative risk score (0-100) based on three factors:
+
+**Formula**: `Risk Score = Exploitability + Impact + Prevalence`
+
+**Components:**
+
+1. **Exploitability (0-40 points)** - How easy is it to exploit?
+   - 40: No authentication required, trivial to exploit (e.g., exposed API key in client code)
+   - 30: Requires minimal skill or common tools (e.g., SQL injection with no WAF)
+   - 20: Requires moderate skill or specific conditions (e.g., race condition requiring precise timing)
+   - 10: Requires advanced skill or rare conditions (e.g., timing attack requiring local network access)
+   - 0: Theoretical only, no practical exploit path
+
+2. **Impact (0-40 points)** - What damage can be done?
+   - 40: Complete system compromise, data breach, or significant financial loss (e.g., RCE, database credential exposure)
+   - 30: Significant data exposure or privilege escalation (e.g., authentication bypass, IDOR exposing all user data)
+   - 20: Limited data exposure or service disruption (e.g., DoS, single user data leak)
+   - 10: Minor information disclosure (e.g., verbose error messages, version disclosure)
+   - 0: No security impact
+
+3. **Prevalence (0-20 points)** - How widespread is the vulnerability?
+   - 20: Affects all users/requests (e.g., disabled RLS on all tables)
+   - 15: Affects major functionality (e.g., authentication bypass on main login)
+   - 10: Affects specific feature or user subset (e.g., admin panel vulnerability)
+   - 5: Affects edge case or rarely used feature
+   - 0: Affects only theoretical scenarios
+
+**Score Interpretation:**
+
+- **90-100**: Critical - Drop everything and fix immediately
+- **70-89**: High - Fix within 24 hours
+- **50-69**: Medium - Fix within 1 week
+- **30-49**: Low - Fix in next sprint
+- **0-29**: Informational - Consider for future improvements
+
+**Example Scoring:**
+
+*Hardcoded database password in source code:*
+- Exploitability: 40 (anyone with repo access can extract it)
+- Impact: 40 (full database compromise)
+- Prevalence: 20 (affects entire system)
+- **Total: 100 (Critical)**
+
+*SQL injection in admin-only endpoint with WAF:*
+- Exploitability: 20 (requires admin access + WAF bypass)
+- Impact: 40 (full database compromise)
+- Prevalence: 10 (admin endpoint only)
+- **Total: 70 (High)**
+
+*Missing rate limiting on public API:*
+- Exploitability: 30 (easy to script)
+- Impact: 20 (service disruption)
+- Prevalence: 15 (affects main API)
+- **Total: 65 (Medium)**
+
 ### Finding Format
 
 For each issue:
@@ -130,7 +193,8 @@ Skip categories with no issues. End with a prioritized action summary.
 
 #### Critical
 
-**`config/database.py:15-17` — Hardcoded database credentials in source code**
+**`config/database.py:15-17` — Hardcoded database credentials in source code** [Risk Score: 100/100]  
+*(Exploitability: 40, Impact: 40, Prevalence: 20)*
 
 Database username and password are hardcoded in the source file. Anyone with access to the repository (including via git history) can extract these credentials and gain full database access, allowing them to read, modify, or delete all data.
 
@@ -162,7 +226,8 @@ db_config = {
 
 ---
 
-**`api/trades.py:45` — SQL Injection in trade history query**
+**`api/trades.py:45` — SQL Injection in trade history query** [Risk Score: 95/100]  
+*(Exploitability: 40, Impact: 40, Prevalence: 15)*
 
 User-supplied `symbol` parameter is directly interpolated into SQL query without sanitization. An attacker can inject arbitrary SQL to extract all user data, modify balances, or delete records.
 
@@ -191,7 +256,8 @@ def get_trades(symbol):
 
 #### High
 
-**`trade_execution/order.py:78-82` — Race condition in balance check**
+**`trade_execution/order.py:78-82` — Race condition in balance check** [Risk Score: 85/100]  
+*(Exploitability: 30, Impact: 40, Prevalence: 15)*
 
 Balance check and deduction are not atomic. Two concurrent requests can both pass the balance check before either deducts, allowing double-spending.
 
@@ -230,7 +296,8 @@ def execute_trade(user_id, amount):
 
 ---
 
-**`frontend/routes.py:34` — Missing CSRF protection on state-changing endpoint**
+**`frontend/routes.py:34` — Missing CSRF protection on state-changing endpoint** [Risk Score: 75/100]  
+*(Exploitability: 30, Impact: 30, Prevalence: 15)*
 
 The `/api/withdraw` endpoint accepts POST requests without CSRF token validation. An attacker can create a malicious website that submits withdrawal requests on behalf of authenticated users who visit the site.
 
@@ -267,7 +334,8 @@ def withdraw():
 
 #### Medium
 
-**`ml_engine/predictor.py:56` — No input validation on prediction features**
+**`ml_engine/predictor.py:56` — No input validation on prediction features** [Risk Score: 55/100]  
+*(Exploitability: 20, Impact: 20, Prevalence: 15)*
 
 Feature values are not validated before being passed to the ML model. Malicious or malformed input could cause crashes, incorrect predictions, or adversarial attacks on the model.
 
@@ -298,7 +366,8 @@ def predict(features):
 
 #### Low
 
-**`app.py:12` — Debug mode enabled**
+**`app.py:12` — Debug mode enabled** [Risk Score: 35/100]  
+*(Exploitability: 10, Impact: 10, Prevalence: 15)*
 
 Flask debug mode is enabled, which exposes the interactive debugger and detailed error messages to users. This can leak sensitive information about the application structure and code.
 
@@ -315,20 +384,22 @@ app.run(debug=os.environ.get('FLASK_ENV') == 'development')
 
 ### Summary
 
-**Immediate action required (Critical):**
-1. Remove hardcoded database credentials and rotate password
-2. Fix SQL injection in trade history endpoint - can lead to full database compromise
+**Total Risk Score: 445/700** (2 Critical, 2 High, 1 Medium, 1 Low)
+
+**Immediate action required (Critical - Risk Score 90+):**
+1. [100] Remove hardcoded database credentials and rotate password
+2. [95] Fix SQL injection in trade history endpoint - can lead to full database compromise
 3. Audit git history for exposed secrets
 
-**High priority (within 24 hours):**
-4. Fix race condition in balance check - enables double-spending
-5. Add CSRF protection to withdrawal endpoint - prevents unauthorized withdrawals
+**High priority (within 24 hours - Risk Score 70-89):**
+4. [85] Fix race condition in balance check - enables double-spending
+5. [75] Add CSRF protection to withdrawal endpoint - prevents unauthorized withdrawals
 
-**Medium priority (within 1 week):**
-6. Add input validation to ML prediction endpoint
+**Medium priority (within 1 week - Risk Score 50-69):**
+6. [55] Add input validation to ML prediction endpoint
 
-**Low priority (next sprint):**
-7. Disable debug mode in production
+**Low priority (next sprint - Risk Score 30-49):**
+7. [35] Disable debug mode in production
 
 ## When Generating Code
 
@@ -344,6 +415,9 @@ These rules apply proactively during code generation. Before writing code that t
 - **WebSockets/Real-time** → Consult `references/realtime-security.md`
 - **Mobile code** → Consult `references/mobile-security.md`
 - **Frontend** → Consult `references/web-security.md`
+- **Dependencies/packages** → Consult `references/dependencies.md`
+- **Library/API design** → Consult `references/sharp-edges.md`
+- **Environment config** → Consult `references/insecure-defaults.md`
 
 Prevention is always better than detection. Build security in from the start.
 
@@ -381,7 +455,9 @@ Application-specific references:
 Infrastructure references:
 - `references/rate-limiting.md` — Rate limiting strategies, abuse prevention
 - `references/deployment.md` — Production configuration, security headers, environment separation
-- `references/dependencies.md` — Supply chain security, vulnerability scanning
+- `references/dependencies.md` — Supply chain security, dependency risk assessment (maintainer health, CVEs, unpinned packages)
+- `references/insecure-defaults.md` — Fail-open patterns, fallback secrets, zero-value bypasses, dangerous default configurations
+- `references/sharp-edges.md` — API footguns, algorithm selection vulnerabilities, dangerous defaults, primitive vs semantic API misuse
 - `references/logging-monitoring.md` — Security logging, audit trails, incident response
 - `references/concurrency.md` — Race conditions, locking, transaction isolation
 - `references/session-management.md` — Session security, state management

@@ -739,6 +739,495 @@ def transfer():
         return jsonify({'error': str(e)}), 400
 ```
 
+## Quick Fix Patterns
+
+### Pattern 1: String Interpolation in SQL → Parameterized Query
+
+**Detection**: Search for f-strings, `.format()`, or `+` concatenation in SQL queries
+
+**Fix (diff format)**:
+```diff
+- query = f"SELECT * FROM users WHERE username = '{username}'"
++ query = "SELECT * FROM users WHERE username = ?"
+- result = db.execute(query)
++ result = db.execute(query, (username,))
+```
+
+**Manual steps**:
+1. Replace all f-strings/concatenation with `?` or `:param` placeholders
+2. Pass user input as separate parameter to `execute()`
+3. Test with SQL injection payload: `username = "admin' OR '1'='1"`
+4. Verify query fails safely instead of returning unauthorized data
+
+### Pattern 2: shell=True → shell=False with List Args
+
+**Detection**: Search for `subprocess` calls with `shell=True`
+
+**Fix (diff format)**:
+```diff
+- subprocess.run(f"ping {host}", shell=True)
++ subprocess.run(["ping", "-c", "4", host], shell=False)
+```
+
+```diff
+- os.system(f"convert {input_file} {output_file}")
++ subprocess.run(["convert", input_file, output_file], shell=False)
+```
+
+**Manual steps**:
+1. Replace `shell=True` with `shell=False`
+2. Convert command string to list: `["command", "arg1", "arg2"]`
+3. Pass user input as separate list elements, not in command string
+4. Test with malicious input: `host = "example.com; rm -rf /"`
+5. Verify command injection is prevented
+
+### Pattern 3: No Input Validation → Add Validation
+
+**Detection**: API endpoints accepting user input without validation
+
+**Fix (diff format)**:
+```diff
++ from pydantic import BaseModel, validator, constr
++ 
++ class UserCreate(BaseModel):
++     username: constr(min_length=3, max_length=50, regex=r'^[a-zA-Z0-9_]+$')
++     email: constr(regex=r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
++     age: int
++     
++     @validator('age')
++     def validate_age(cls, v):
++         if not 13 <= v <= 120:
++             raise ValueError('Age must be between 13 and 120')
++         return v
++
+  @app.post('/api/users')
+- def create_user(username: str, email: str, age: int):
++ def create_user(user: UserCreate):
+-     db.create_user(username, email, age)
++     db.create_user(user.username, user.email, user.age)
+```
+
+**Manual steps**:
+1. Define validation schema (Pydantic, Joi, Yup, etc.)
+2. Add type validation (string, int, email, etc.)
+3. Add length/range constraints
+4. Add format validation (regex patterns)
+5. Apply schema to API endpoint
+6. Test with invalid input to verify validation works
+
+### Pattern 4: Path Traversal → Path Sanitization
+
+**Detection**: File operations using user-provided paths without validation
+
+**Fix (diff format)**:
+```diff
++ from pathlib import Path
++ import os
++ 
++ UPLOAD_DIR = Path('/var/www/uploads')
++ 
+  def get_file(filename):
+-     with open(f'/var/www/uploads/{filename}', 'r') as f:
++     # Resolve to absolute path and verify it's within UPLOAD_DIR
++     file_path = (UPLOAD_DIR / filename).resolve()
++     
++     if not file_path.is_relative_to(UPLOAD_DIR):
++         raise ValueError('Invalid file path')
++     
++     if not file_path.exists():
++         raise FileNotFoundError('File not found')
++     
++     with open(file_path, 'r') as f:
+          return f.read()
+```
+
+**Manual steps**:
+1. Define allowed base directory
+2. Use `Path().resolve()` to get absolute path
+3. Check path is within allowed directory using `.is_relative_to()`
+4. Validate file exists and is a file (not directory)
+5. Test with traversal payloads: `../../etc/passwd`, `..\\..\\windows\\system32\\config\\sam`
+6. Verify access is denied to files outside allowed directory
+
+## Framework-Specific Guidance
+
+### Python (Pydantic, marshmallow, Django forms)
+
+**Pydantic (FastAPI)**:
+```python
+from pydantic import BaseModel, Field, validator, constr, conint
+from typing import Optional
+from datetime import datetime
+
+class UserCreate(BaseModel):
+    username: constr(min_length=3, max_length=50, regex=r'^[a-zA-Z0-9_]+$')
+    email: constr(regex=r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
+    age: conint(ge=13, le=120)
+    bio: Optional[constr(max_length=500)] = None
+    
+    @validator('username')
+    def username_no_profanity(cls, v):
+        if any(word in v.lower() for word in ['admin', 'root', 'system']):
+            raise ValueError('Username contains reserved word')
+        return v
+    
+    @validator('email')
+    def email_domain_allowed(cls, v):
+        allowed_domains = ['example.com', 'company.com']
+        domain = v.split('@')[1]
+        if domain not in allowed_domains:
+            raise ValueError(f'Email domain must be one of: {allowed_domains}')
+        return v
+
+class OrderCreate(BaseModel):
+    product_id: int = Field(gt=0)
+    quantity: int = Field(gt=0, le=100)
+    price: float = Field(gt=0, le=1000000)
+    
+    @validator('price')
+    def price_two_decimals(cls, v):
+        if round(v, 2) != v:
+            raise ValueError('Price must have at most 2 decimal places')
+        return v
+
+# Usage in FastAPI
+from fastapi import FastAPI, HTTPException
+
+app = FastAPI()
+
+@app.post('/api/users')
+def create_user(user: UserCreate):
+    # Pydantic automatically validates
+    db.create_user(user.dict())
+    return {'status': 'created'}
+```
+
+**Django Forms**:
+```python
+from django import forms
+from django.core.validators import MinLengthValidator, MaxLengthValidator, RegexValidator
+import re
+
+class UserCreateForm(forms.Form):
+    username = forms.CharField(
+        min_length=3,
+        max_length=50,
+        validators=[
+            RegexValidator(r'^[a-zA-Z0-9_]+$', 'Username can only contain letters, numbers, and underscores')
+        ]
+    )
+    email = forms.EmailField()
+    age = forms.IntegerField(min_value=13, max_value=120)
+    bio = forms.CharField(max_length=500, required=False, widget=forms.Textarea)
+    
+    def clean_username(self):
+        username = self.cleaned_data['username']
+        reserved_words = ['admin', 'root', 'system']
+        if any(word in username.lower() for word in reserved_words):
+            raise forms.ValidationError('Username contains reserved word')
+        return username
+    
+    def clean_email(self):
+        email = self.cleaned_data['email']
+        allowed_domains = ['example.com', 'company.com']
+        domain = email.split('@')[1]
+        if domain not in allowed_domains:
+            raise forms.ValidationError(f'Email domain must be one of: {allowed_domains}')
+        return email
+
+# Usage in Django view
+from django.http import JsonResponse
+
+def create_user(request):
+    form = UserCreateForm(request.POST)
+    if form.is_valid():
+        db.create_user(form.cleaned_data)
+        return JsonResponse({'status': 'created'})
+    return JsonResponse({'errors': form.errors}, status=400)
+```
+
+**marshmallow**:
+```python
+from marshmallow import Schema, fields, validate, validates, ValidationError
+
+class UserCreateSchema(Schema):
+    username = fields.Str(
+        required=True,
+        validate=[
+            validate.Length(min=3, max=50),
+            validate.Regexp(r'^[a-zA-Z0-9_]+$', error='Username can only contain letters, numbers, and underscores')
+        ]
+    )
+    email = fields.Email(required=True)
+    age = fields.Int(required=True, validate=validate.Range(min=13, max=120))
+    bio = fields.Str(validate=validate.Length(max=500))
+    
+    @validates('username')
+    def validate_username(self, value):
+        reserved_words = ['admin', 'root', 'system']
+        if any(word in value.lower() for word in reserved_words):
+            raise ValidationError('Username contains reserved word')
+    
+    @validates('email')
+    def validate_email_domain(self, value):
+        allowed_domains = ['example.com', 'company.com']
+        domain = value.split('@')[1]
+        if domain not in allowed_domains:
+            raise ValidationError(f'Email domain must be one of: {allowed_domains}')
+
+# Usage
+schema = UserCreateSchema()
+
+try:
+    result = schema.load(request.json)
+    db.create_user(result)
+except ValidationError as err:
+    return jsonify({'errors': err.messages}), 400
+```
+
+### JavaScript (Joi, Yup, Zod)
+
+**Joi (Express)**:
+```javascript
+const Joi = require('joi');
+
+const userCreateSchema = Joi.object({
+  username: Joi.string()
+    .min(3)
+    .max(50)
+    .pattern(/^[a-zA-Z0-9_]+$/)
+    .required()
+    .messages({
+      'string.pattern.base': 'Username can only contain letters, numbers, and underscores'
+    }),
+  email: Joi.string()
+    .email()
+    .required()
+    .custom((value, helpers) => {
+      const allowedDomains = ['example.com', 'company.com'];
+      const domain = value.split('@')[1];
+      if (!allowedDomains.includes(domain)) {
+        return helpers.error('any.invalid');
+      }
+      return value;
+    })
+    .messages({
+      'any.invalid': 'Email domain must be example.com or company.com'
+    }),
+  age: Joi.number()
+    .integer()
+    .min(13)
+    .max(120)
+    .required(),
+  bio: Joi.string()
+    .max(500)
+    .optional()
+});
+
+// Usage in Express
+app.post('/api/users', (req, res) => {
+  const { error, value } = userCreateSchema.validate(req.body);
+  
+  if (error) {
+    return res.status(400).json({ errors: error.details });
+  }
+  
+  db.createUser(value);
+  res.json({ status: 'created' });
+});
+```
+
+**Yup (React/Next.js)**:
+```javascript
+import * as yup from 'yup';
+
+const userCreateSchema = yup.object({
+  username: yup.string()
+    .min(3)
+    .max(50)
+    .matches(/^[a-zA-Z0-9_]+$/, 'Username can only contain letters, numbers, and underscores')
+    .required(),
+  email: yup.string()
+    .email()
+    .test('domain', 'Email domain must be example.com or company.com', (value) => {
+      if (!value) return false;
+      const allowedDomains = ['example.com', 'company.com'];
+      const domain = value.split('@')[1];
+      return allowedDomains.includes(domain);
+    })
+    .required(),
+  age: yup.number()
+    .integer()
+    .min(13)
+    .max(120)
+    .required(),
+  bio: yup.string()
+    .max(500)
+    .optional()
+});
+
+// Usage in API route
+export default async function handler(req, res) {
+  try {
+    const validated = await userCreateSchema.validate(req.body);
+    await db.createUser(validated);
+    res.json({ status: 'created' });
+  } catch (error) {
+    res.status(400).json({ errors: error.errors });
+  }
+}
+```
+
+**Zod (TypeScript)**:
+```typescript
+import { z } from 'zod';
+
+const userCreateSchema = z.object({
+  username: z.string()
+    .min(3)
+    .max(50)
+    .regex(/^[a-zA-Z0-9_]+$/, 'Username can only contain letters, numbers, and underscores')
+    .refine((val) => {
+      const reserved = ['admin', 'root', 'system'];
+      return !reserved.some(word => val.toLowerCase().includes(word));
+    }, 'Username contains reserved word'),
+  email: z.string()
+    .email()
+    .refine((val) => {
+      const allowedDomains = ['example.com', 'company.com'];
+      const domain = val.split('@')[1];
+      return allowedDomains.includes(domain);
+    }, 'Email domain must be example.com or company.com'),
+  age: z.number()
+    .int()
+    .min(13)
+    .max(120),
+  bio: z.string()
+    .max(500)
+    .optional()
+});
+
+type UserCreate = z.infer<typeof userCreateSchema>;
+
+// Usage in API route
+export default async function handler(req: Request, res: Response) {
+  try {
+    const validated = userCreateSchema.parse(req.body);
+    await db.createUser(validated);
+    res.json({ status: 'created' });
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      res.status(400).json({ errors: error.errors });
+    }
+  }
+}
+```
+
+### SQL (SQLAlchemy, Prisma, TypeORM)
+
+**SQLAlchemy Parameterized Queries**:
+```python
+from sqlalchemy import select, text
+from sqlalchemy.orm import Session
+
+# Pattern 1: ORM (preferred - automatic parameterization)
+def get_user_by_username(db: Session, username: str):
+    stmt = select(User).where(User.username == username)
+    return db.execute(stmt).scalar_one_or_none()
+
+# Pattern 2: text() with named parameters
+def search_products(db: Session, keyword: str, min_price: float):
+    stmt = text("""
+        SELECT * FROM products 
+        WHERE name LIKE :keyword 
+        AND price >= :min_price
+    """)
+    return db.execute(stmt, {
+        "keyword": f"%{keyword}%",
+        "min_price": min_price
+    }).fetchall()
+
+# Pattern 3: Complex query with multiple conditions
+def get_orders(db: Session, user_id: int, status: str, min_amount: float):
+    stmt = (
+        select(Order)
+        .where(Order.user_id == user_id)
+        .where(Order.status == status)
+        .where(Order.amount >= min_amount)
+        .order_by(Order.created_at.desc())
+    )
+    return db.execute(stmt).scalars().all()
+```
+
+**Prisma (TypeScript)**:
+```typescript
+import { PrismaClient } from '@prisma/client';
+
+const prisma = new PrismaClient();
+
+// Prisma automatically parameterizes all queries
+async function getUserByUsername(username: string) {
+  return await prisma.user.findUnique({
+    where: { username }
+  });
+}
+
+async function searchProducts(keyword: string, minPrice: number) {
+  return await prisma.product.findMany({
+    where: {
+      name: {
+        contains: keyword,  // Automatically parameterized
+      },
+      price: {
+        gte: minPrice,
+      },
+    },
+  });
+}
+
+// Raw queries (use with caution, still parameterized)
+async function customQuery(userId: number) {
+  return await prisma.$queryRaw`
+    SELECT * FROM orders 
+    WHERE user_id = ${userId}
+    ORDER BY created_at DESC
+  `;
+}
+```
+
+**TypeORM**:
+```typescript
+import { getRepository } from 'typeorm';
+import { User } from './entities/User';
+
+// Pattern 1: Query builder (automatic parameterization)
+async function getUserByUsername(username: string) {
+  return await getRepository(User)
+    .createQueryBuilder('user')
+    .where('user.username = :username', { username })
+    .getOne();
+}
+
+// Pattern 2: Find with conditions
+async function searchProducts(keyword: string, minPrice: number) {
+  return await getRepository(Product)
+    .createQueryBuilder('product')
+    .where('product.name LIKE :keyword', { keyword: `%${keyword}%` })
+    .andWhere('product.price >= :minPrice', { minPrice })
+    .getMany();
+}
+
+// Pattern 3: Complex query
+async function getOrders(userId: number, status: string) {
+  return await getRepository(Order)
+    .createQueryBuilder('order')
+    .where('order.userId = :userId', { userId })
+    .andWhere('order.status = :status', { status })
+    .orderBy('order.createdAt', 'DESC')
+    .getMany();
+}
+```
+
 ## Detection Checklist
 
 - [ ] No string interpolation in SQL queries

@@ -787,6 +787,525 @@ def create_payment():
     return jsonify(response), status_code
 ```
 
+## Quick Fix Patterns
+
+### Pattern 1: Float for Money → Decimal
+
+**Detection**: Search for `float` type in financial calculations, price fields, balance operations
+
+**Fix (diff format)**:
+```diff
+- price = 19.99
+- total = price * quantity
++ from decimal import Decimal
++ price = Decimal('19.99')
++ total = price * quantity
+```
+
+```diff
+# Database schema
+- balance FLOAT
++ balance DECIMAL(19, 4)
+```
+
+```diff
+# Python model
+  class Product(Base):
+-     price = Column(Float)
++     price = Column(Numeric(19, 4))
+```
+
+**Manual steps**:
+1. Replace all `float` with `Decimal` for money values
+2. Use string constructor: `Decimal('19.99')` not `Decimal(19.99)`
+3. Update database schema to `DECIMAL(precision, scale)`
+4. Set precision/scale appropriately (e.g., 19,4 for most currencies)
+5. Test calculations to verify precision is maintained
+6. Migrate existing data: `UPDATE products SET price = CAST(price AS DECIMAL(19,4))`
+
+### Pattern 2: Client-Side Price → Server-Side Lookup
+
+**Detection**: Prices, amounts, or totals coming from request body/query params
+
+**Fix (diff format)**:
+```diff
+  @app.post('/api/orders')
+  def create_order(product_id: int, quantity: int, price: Decimal):
+-     total = price * quantity
++     # Look up price from database, don't trust client
++     product = db.query(Product).get(product_id)
++     if not product:
++         raise ValueError('Product not found')
++     
++     total = product.price * quantity
+      order = Order(product_id=product_id, quantity=quantity, total=total)
+      db.add(order)
+      db.commit()
+```
+
+**Manual steps**:
+1. Remove price/amount parameters from API endpoints
+2. Look up prices from database using product_id
+3. Calculate totals server-side only
+4. Validate quantity is positive and within limits
+5. Test with modified client requests to verify server rejects client prices
+6. Add logging for price mismatch attempts
+
+### Pattern 3: No Transaction Lock → SELECT FOR UPDATE
+
+**Detection**: Balance updates, inventory changes without row locking
+
+**Fix (diff format)**:
+```diff
+  def transfer_funds(from_user_id, to_user_id, amount):
+-     from_user = db.query(User).get(from_user_id)
+-     to_user = db.query(User).get(to_user_id)
++     with db.begin():
++         from_user = db.session.execute(
++             select(User).where(User.id == from_user_id).with_for_update()
++         ).scalar_one()
++         
++         to_user = db.session.execute(
++             select(User).where(User.id == to_user_id).with_for_update()
++         ).scalar_one()
+          
+          if from_user.balance < amount:
+              raise InsufficientFundsError()
+          
+          from_user.balance -= amount
+          to_user.balance += amount
+-         db.commit()
+```
+
+**Manual steps**:
+1. Wrap financial operations in transaction: `with db.begin():`
+2. Add `.with_for_update()` to SELECT queries
+3. Perform all checks before modifying data
+4. Let transaction auto-commit on success
+5. Test with concurrent requests to verify no race conditions
+6. Monitor for deadlocks and adjust lock order if needed
+
+### Pattern 4: Missing Audit Log → Add Comprehensive Logging
+
+**Detection**: Financial operations without audit trail
+
+**Fix (diff format)**:
+```diff
++ def log_transaction(user_id, transaction_type, amount, details):
++     audit_log = AuditLog(
++         user_id=user_id,
++         transaction_type=transaction_type,
++         amount=amount,
++         details=json.dumps(details),
++         ip_address=request.remote_addr,
++         user_agent=request.headers.get('User-Agent'),
++         timestamp=datetime.utcnow()
++     )
++     db.add(audit_log)
++
+  def transfer_funds(from_user_id, to_user_id, amount):
+      with db.begin():
+          # ... transfer logic ...
+          
++         # Log both sides of transaction
++         log_transaction(from_user_id, 'transfer_out', amount, {
++             'to_user_id': to_user_id,
++             'balance_before': from_balance,
++             'balance_after': from_user.balance
++         })
++         
++         log_transaction(to_user_id, 'transfer_in', amount, {
++             'from_user_id': from_user_id,
++             'balance_before': to_balance,
++             'balance_after': to_user.balance
++         })
+```
+
+**Manual steps**:
+1. Create audit_logs table with all relevant fields
+2. Log every financial operation (deposits, withdrawals, transfers, purchases)
+3. Include: user_id, amount, type, timestamp, IP, user agent, before/after balances
+4. Make audit logging atomic with the transaction
+5. Set up alerts for suspicious patterns
+6. Implement log retention policy (7+ years for financial records)
+
+## Framework-Specific Guidance
+
+### Python (decimal module, SQLAlchemy transactions)
+
+**Decimal Usage**:
+```python
+from decimal import Decimal, ROUND_HALF_UP, getcontext
+
+# Set precision globally
+getcontext().prec = 28
+
+# Always use string constructor
+price = Decimal('19.99')
+quantity = Decimal('3')
+total = price * quantity  # Decimal('59.97')
+
+# Rounding
+tax_rate = Decimal('0.0825')
+tax = (total * tax_rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+# Comparison
+if balance >= amount:
+    # Safe comparison
+
+# Avoid float conversion
+bad = Decimal(19.99)  # WRONG: float precision issues
+good = Decimal('19.99')  # CORRECT
+
+# Database operations
+from sqlalchemy import Numeric
+
+class Product(Base):
+    __tablename__ = 'products'
+    id = Column(Integer, primary_key=True)
+    price = Column(Numeric(19, 4), nullable=False)  # 19 digits, 4 decimal places
+    
+class User(Base):
+    __tablename__ = 'users'
+    id = Column(Integer, primary_key=True)
+    balance = Column(Numeric(19, 4), nullable=False, default=Decimal('0'))
+```
+
+**Transaction Patterns**:
+```python
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+from decimal import Decimal
+
+def transfer_funds(db: Session, from_user_id: int, to_user_id: int, amount: Decimal):
+    """Transfer funds between users with proper locking and validation"""
+    if amount <= 0:
+        raise ValueError('Amount must be positive')
+    
+    with db.begin():
+        # Lock rows in consistent order to prevent deadlocks
+        user_ids = sorted([from_user_id, to_user_id])
+        
+        users = {}
+        for user_id in user_ids:
+            user = db.execute(
+                select(User).where(User.id == user_id).with_for_update()
+            ).scalar_one_or_none()
+            
+            if not user:
+                raise ValueError(f'User {user_id} not found')
+            users[user_id] = user
+        
+        from_user = users[from_user_id]
+        to_user = users[to_user_id]
+        
+        # Validate balance
+        if from_user.balance < amount:
+            raise ValueError('Insufficient funds')
+        
+        # Record balances before
+        from_balance_before = from_user.balance
+        to_balance_before = to_user.balance
+        
+        # Perform transfer
+        from_user.balance -= amount
+        to_user.balance += amount
+        
+        # Create transaction records
+        transaction = Transaction(
+            from_user_id=from_user_id,
+            to_user_id=to_user_id,
+            amount=amount,
+            status='completed',
+            created_at=datetime.utcnow()
+        )
+        db.add(transaction)
+        
+        # Audit log
+        audit_log = AuditLog(
+            transaction_id=transaction.id,
+            from_user_id=from_user_id,
+            to_user_id=to_user_id,
+            amount=amount,
+            from_balance_before=from_balance_before,
+            from_balance_after=from_user.balance,
+            to_balance_before=to_balance_before,
+            to_balance_after=to_user.balance,
+            ip_address=get_client_ip(),
+            timestamp=datetime.utcnow()
+        )
+        db.add(audit_log)
+        
+        # Transaction commits automatically on exit
+
+def process_payment(db: Session, user_id: int, amount: Decimal, payment_method: str):
+    """Process payment with idempotency"""
+    idempotency_key = request.headers.get('Idempotency-Key')
+    if not idempotency_key:
+        raise ValueError('Idempotency-Key required')
+    
+    # Check if already processed
+    existing = db.execute(
+        select(Payment).where(Payment.idempotency_key == idempotency_key)
+    ).scalar_one_or_none()
+    
+    if existing:
+        return existing  # Return existing result
+    
+    with db.begin():
+        user = db.execute(
+            select(User).where(User.id == user_id).with_for_update()
+        ).scalar_one()
+        
+        # Process payment...
+        payment = Payment(
+            user_id=user_id,
+            amount=amount,
+            payment_method=payment_method,
+            idempotency_key=idempotency_key,
+            status='completed',
+            created_at=datetime.utcnow()
+        )
+        db.add(payment)
+        
+        user.balance += amount
+        
+        return payment
+```
+
+### JavaScript (decimal.js, dinero.js)
+
+**decimal.js**:
+```javascript
+const Decimal = require('decimal.js');
+
+// Configure precision
+Decimal.set({ precision: 28, rounding: Decimal.ROUND_HALF_UP });
+
+// Basic operations
+const price = new Decimal('19.99');
+const quantity = new Decimal('3');
+const total = price.times(quantity);  // 59.97
+
+// Tax calculation
+const taxRate = new Decimal('0.0825');
+const tax = total.times(taxRate).toDecimalPlaces(2);
+
+// Comparison
+if (balance.greaterThanOrEqualTo(amount)) {
+    // Proceed with transaction
+}
+
+// Database storage (store as string or integer cents)
+const priceInCents = price.times(100).toNumber();  // 1999
+// Or as string
+const priceString = price.toString();  // '19.99'
+```
+
+**dinero.js (recommended for currency)**:
+```javascript
+const Dinero = require('dinero.js');
+
+// Create money object (amount in cents)
+const price = Dinero({ amount: 1999, currency: 'USD' });  // $19.99
+const quantity = 3;
+const total = price.multiply(quantity);  // $59.97
+
+// Tax calculation
+const taxRate = 0.0825;
+const tax = total.percentage(taxRate * 100);
+
+// Formatting
+console.log(total.toFormat('$0,0.00'));  // $59.97
+
+// Comparison
+if (balance.greaterThanOrEqual(amount)) {
+    // Proceed
+}
+
+// Database storage
+const amountInCents = total.getAmount();  // 5997
+const currency = total.getCurrency();  // 'USD'
+
+// Multiple currencies
+const usd = Dinero({ amount: 1000, currency: 'USD' });
+const eur = Dinero({ amount: 850, currency: 'EUR' });
+// Can't add directly - need exchange rate
+```
+
+### Stripe (webhook verification, idempotency)
+
+**Webhook Verification**:
+```javascript
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+
+app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  
+  let event;
+  
+  try {
+    // Verify webhook signature
+    event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+  } catch (err) {
+    console.error('Webhook signature verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+  
+  // Handle event
+  switch (event.type) {
+    case 'payment_intent.succeeded':
+      const paymentIntent = event.data.object;
+      await handlePaymentSuccess(paymentIntent);
+      break;
+      
+    case 'payment_intent.payment_failed':
+      const failedPayment = event.data.object;
+      await handlePaymentFailure(failedPayment);
+      break;
+      
+    default:
+      console.log(`Unhandled event type: ${event.type}`);
+  }
+  
+  res.json({ received: true });
+});
+```
+
+**Idempotency**:
+```javascript
+// Client-side: Generate idempotency key
+const idempotencyKey = `${userId}-${Date.now()}-${Math.random()}`;
+
+// Create payment with idempotency
+const paymentIntent = await stripe.paymentIntents.create({
+  amount: 1999,  // $19.99 in cents
+  currency: 'usd',
+  customer: customerId,
+  metadata: {
+    order_id: orderId,
+  },
+}, {
+  idempotencyKey: idempotencyKey,
+});
+
+// Stripe guarantees: same idempotency key = same result
+// Prevents duplicate charges on retry
+```
+
+### Trading APIs (CCXT patterns, order validation)
+
+**CCXT Safe Trading**:
+```javascript
+const ccxt = require('ccxt');
+const Decimal = require('decimal.js');
+
+const exchange = new ccxt.binance({
+  apiKey: process.env.BINANCE_API_KEY,
+  secret: process.env.BINANCE_SECRET_KEY,
+  enableRateLimit: true,  // CRITICAL: Prevent rate limit bans
+});
+
+async function placeLimitOrder(symbol, side, amount, price) {
+  // Validate inputs
+  if (!['buy', 'sell'].includes(side)) {
+    throw new Error('Invalid side');
+  }
+  
+  const amountDecimal = new Decimal(amount);
+  const priceDecimal = new Decimal(price);
+  
+  if (amountDecimal.lessThanOrEqualTo(0) || priceDecimal.lessThanOrEqualTo(0)) {
+    throw new Error('Amount and price must be positive');
+  }
+  
+  // Fetch market info for validation
+  const markets = await exchange.loadMarkets();
+  const market = markets[symbol];
+  
+  if (!market) {
+    throw new Error(`Market ${symbol} not found`);
+  }
+  
+  // Validate against market limits
+  if (amountDecimal.lessThan(market.limits.amount.min)) {
+    throw new Error(`Amount below minimum: ${market.limits.amount.min}`);
+  }
+  
+  if (amountDecimal.greaterThan(market.limits.amount.max)) {
+    throw new Error(`Amount above maximum: ${market.limits.amount.max}`);
+  }
+  
+  // Check balance before placing order
+  const balance = await exchange.fetchBalance();
+  const currency = side === 'buy' ? market.quote : market.base;
+  const required = side === 'buy' 
+    ? amountDecimal.times(priceDecimal) 
+    : amountDecimal;
+  
+  if (new Decimal(balance[currency].free).lessThan(required)) {
+    throw new Error('Insufficient balance');
+  }
+  
+  // Place order with idempotency
+  const clientOrderId = `${Date.now()}-${Math.random().toString(36)}`;
+  
+  try {
+    const order = await exchange.createLimitOrder(
+      symbol,
+      side,
+      amount,
+      price,
+      { clientOrderId }
+    );
+    
+    // Log order
+    await logOrder({
+      exchange: 'binance',
+      symbol,
+      side,
+      amount,
+      price,
+      orderId: order.id,
+      clientOrderId,
+      timestamp: new Date(),
+    });
+    
+    return order;
+  } catch (error) {
+    // Log failed order attempt
+    await logOrderError({
+      exchange: 'binance',
+      symbol,
+      side,
+      amount,
+      price,
+      error: error.message,
+      timestamp: new Date(),
+    });
+    throw error;
+  }
+}
+
+// Position limits
+const MAX_POSITION_SIZE = new Decimal('10000');  // $10,000 max position
+const MAX_DAILY_VOLUME = new Decimal('50000');   // $50,000 max daily volume
+
+async function validatePositionLimits(userId, newOrderValue) {
+  const currentPosition = await getCurrentPosition(userId);
+  const dailyVolume = await getDailyVolume(userId);
+  
+  if (currentPosition.plus(newOrderValue).greaterThan(MAX_POSITION_SIZE)) {
+    throw new Error('Position size limit exceeded');
+  }
+  
+  if (dailyVolume.plus(newOrderValue).greaterThan(MAX_DAILY_VOLUME)) {
+    throw new Error('Daily volume limit exceeded');
+  }
+}
+```
+
 ## Detection Checklist
 
 - [ ] All financial calculations use Decimal, not float

@@ -61,9 +61,41 @@ This skill provides:
 
 ## Installation
 
-### For Kiro IDE
+### Quick Install (Recommended)
 
-1. Copy the entire `vibe-security-enhanced` folder to your skills directory:
+Use the unified installer to install both Vibe Security Enhanced and Superpowers Skills Framework:
+
+**Windows:**
+```cmd
+INSTALL-ALL.bat
+```
+
+**Mac/Linux:**
+```bash
+chmod +x INSTALL-ALL.sh
+./INSTALL-ALL.sh
+```
+
+See `INSTALL-ALL.md` for detailed instructions.
+
+### Install Vibe Security Only
+
+**Windows:**
+```cmd
+INSTALL.bat
+```
+
+**Mac/Linux:**
+```bash
+chmod +x INSTALL.sh
+./INSTALL.sh
+```
+
+See `HOW_TO_INSTALL.md` for detailed instructions.
+
+### Manual Installation
+
+#### For Kiro IDE
 
 ```bash
 # User-level (applies to all projects)
@@ -73,15 +105,7 @@ cp -r vibe-security-enhanced ~/.kiro/skills/
 cp -r vibe-security-enhanced /path/to/project/.kiro/skills/
 ```
 
-2. The skill will automatically activate when you:
-   - Ask about security
-   - Request code reviews
-   - Mention authentication, payments, databases, APIs, secrets
-   - Work with financial operations, ML models, or sensitive data
-
-### For Claude Code
-
-1. Copy the folder to Claude's skills directory:
+#### For Claude Code
 
 ```bash
 # User-level
@@ -91,28 +115,32 @@ cp -r vibe-security-enhanced ~/.claude/skills/
 cp -r vibe-security-enhanced /path/to/project/.claude/skills/
 ```
 
-2. Use `/vibe-security-enhanced` to trigger audits, or ask naturally:
-   - "check my code for security issues"
-   - "is this safe?"
-   - "audit this project"
-   - "review for vulnerabilities"
+#### For Cursor
 
-### For Cursor
-
-1. Copy the folder to Cursor's skills directory:
+Cursor uses `.cursor/rules/` directory:
 
 ```bash
-cp -r vibe-security-enhanced ~/.cursor/skills/
+# User-level
+cp -r superpowers-skills/steering/* ~/.cursor/rules/superpowers/
+cp vibe-security-enhanced/skill.md ~/.cursor/rules/security/
+cp -r vibe-security-enhanced/references ~/.cursor/rules/security/
 ```
 
-2. The skill will activate automatically based on context.
+Note: Cursor uses a "rules" system instead of separate steering/skills directories.
 
-### For Other AI Assistants
+### Activation
 
-If your AI assistant supports skills/context files:
+The skill will automatically activate when you:
+- Ask about security
+- Request code reviews
+- Mention authentication, payments, databases, APIs, secrets
+- Work with financial operations, ML models, or sensitive data
 
-1. Copy the `skill.md` file and `references/` folder to your assistant's configuration directory
-2. Refer to your assistant's documentation for the exact location
+Or trigger manually:
+- "check my code for security issues"
+- "is this safe?"
+- "audit this project"
+- "review for vulnerabilities"
 
 ## Usage
 

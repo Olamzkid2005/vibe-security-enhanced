@@ -828,6 +828,461 @@ def revoke_api_key(api_key):
     db.execute("UPDATE api_keys SET revoked = 1 WHERE key = ?", (api_key,))
 ```
 
+## Quick Fix Patterns
+
+### Pattern 1: JWT Without Verification → Add Verification
+
+**Detection**: Search for `jwt.decode(..., verify_signature=False)` or `jwt.decode(token)` without secret
+
+**Fix (diff format)**:
+```diff
+- payload = jwt.decode(token, options={"verify_signature": False})
++ JWT_SECRET = os.environ['JWT_SECRET']
++ payload = jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
+```
+
+**Manual steps**:
+1. Add JWT_SECRET to environment variables
+2. Replace all `jwt.decode()` calls with proper verification
+3. Specify allowed algorithms explicitly: `algorithms=['HS256']`
+4. Add try/except for `jwt.ExpiredSignatureError` and `jwt.InvalidTokenError`
+5. Test with valid and invalid tokens to ensure verification works
+
+### Pattern 2: MD5 Password Hash → bcrypt
+
+**Detection**: Search for `hashlib.md5`, `hashlib.sha1`, `hashlib.sha256` used for passwords
+
+**Fix (diff format)**:
+```diff
+- import hashlib
+- password_hash = hashlib.md5(password.encode()).hexdigest()
++ import bcrypt
++ password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=12))
+```
+
+```diff
+- def verify_password(password, stored_hash):
+-     return hashlib.md5(password.encode()).hexdigest() == stored_hash
++ def verify_password(password, stored_hash):
++     return bcrypt.checkpw(password.encode(), stored_hash)
+```
+
+**Manual steps**:
+1. Install bcrypt: `pip install bcrypt` or `npm install bcrypt`
+2. Update password creation to use `bcrypt.hashpw()` with salt
+3. Update password verification to use `bcrypt.checkpw()`
+4. **IMPORTANT**: Existing password hashes must be migrated:
+   - Option A: Force password reset for all users
+   - Option B: Hybrid verification (check old hash, rehash on successful login)
+5. Update database schema if needed (bcrypt hashes are longer than MD5)
+
+### Pattern 3: No Session Expiration → Add Expiration
+
+**Detection**: Sessions stored without expiration timestamp
+
+**Fix (diff format)**:
+```diff
++ from datetime import datetime, timedelta
++
+  def create_session(user_id):
+      session_id = secrets.token_urlsafe(32)
++     expires_at = datetime.utcnow() + timedelta(hours=24)
+      db.execute("""
+-         INSERT INTO sessions (session_id, user_id)
+-         VALUES (?, ?)
+-     """, (session_id, user_id))
++         INSERT INTO sessions (session_id, user_id, expires_at)
++         VALUES (?, ?, ?)
++     """, (session_id, user_id, expires_at))
+```
+
+```diff
+  def verify_session(session_id):
+      session = db.execute("""
+-         SELECT * FROM sessions WHERE session_id = ?
+-     """, (session_id,)).fetchone()
++         SELECT * FROM sessions 
++         WHERE session_id = ? AND expires_at > ?
++     """, (session_id, datetime.utcnow())).fetchone()
+```
+
+**Manual steps**:
+1. Add `expires_at` column to sessions table: `ALTER TABLE sessions ADD COLUMN expires_at TIMESTAMP`
+2. Update session creation to set expiration (24 hours recommended)
+3. Update session verification to check expiration
+4. Add cleanup job to delete expired sessions periodically
+5. Test session expiration behavior
+
+### Pattern 4: Missing Auth Decorator → Add @require_auth
+
+**Detection**: API endpoints without authentication checks
+
+**Fix (diff format)**:
+```diff
++ from functools import wraps
++ 
++ def require_auth(f):
++     @wraps(f)
++     def decorated_function(*args, **kwargs):
++         token = request.headers.get('Authorization', '').replace('Bearer ', '')
++         if not token:
++             return jsonify({'error': 'No token provided'}), 401
++         try:
++             payload = verify_token(token)
++             request.user_id = payload['user_id']
++             request.user_role = payload['role']
++         except Exception:
++             return jsonify({'error': 'Invalid token'}), 401
++         return f(*args, **kwargs)
++     return decorated_function
++
+  @app.route('/api/user/profile')
++ @require_auth
+  def get_profile():
+-     user_id = request.args.get('user_id')
++     user_id = request.user_id  # From verified token
+      return jsonify(get_user(user_id))
+```
+
+**Manual steps**:
+1. Create `require_auth` decorator function
+2. Add decorator to all protected endpoints
+3. Replace client-provided user_id with `request.user_id` from token
+4. Test with valid token, invalid token, and no token
+5. Verify all protected endpoints require authentication
+
+## Framework-Specific Guidance
+
+### Django (django.contrib.auth, JWT, Sessions)
+
+**Built-in Authentication**:
+```python
+# settings.py
+INSTALLED_APPS = [
+    'django.contrib.auth',
+    'django.contrib.contenttypes',
+    'django.contrib.sessions',
+]
+
+MIDDLEWARE = [
+    'django.contrib.sessions.middleware.SessionMiddleware',
+    'django.contrib.auth.middleware.AuthenticationMiddleware',
+]
+
+# Password hashing (Django uses PBKDF2 by default, can use Argon2)
+PASSWORD_HASHERS = [
+    'django.contrib.auth.hashers.Argon2PasswordHasher',
+    'django.contrib.auth.hashers.PBKDF2PasswordHasher',
+]
+
+# Session settings
+SESSION_COOKIE_AGE = 86400  # 24 hours
+SESSION_COOKIE_SECURE = True  # HTTPS only
+SESSION_COOKIE_HTTPONLY = True  # No JavaScript access
+SESSION_COOKIE_SAMESITE = 'Lax'  # CSRF protection
+
+# views.py
+from django.contrib.auth import authenticate, login, logout
+from django.contrib.auth.decorators import login_required
+
+def login_view(request):
+    username = request.POST['username']
+    password = request.POST['password']
+    user = authenticate(request, username=username, password=password)
+    if user is not None:
+        login(request, user)
+        return redirect('dashboard')
+    return render(request, 'login.html', {'error': 'Invalid credentials'})
+
+@login_required
+def profile_view(request):
+    # request.user is automatically populated
+    return render(request, 'profile.html', {'user': request.user})
+
+def logout_view(request):
+    logout(request)
+    return redirect('login')
+```
+
+**Django REST Framework with JWT**:
+```python
+# settings.py
+INSTALLED_APPS = [
+    'rest_framework',
+    'rest_framework_simplejwt',
+]
+
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'rest_framework_simplejwt.authentication.JWTAuthentication',
+    ],
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.IsAuthenticated',
+    ],
+}
+
+from datetime import timedelta
+
+SIMPLE_JWT = {
+    'ACCESS_TOKEN_LIFETIME': timedelta(hours=1),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
+    'ALGORITHM': 'HS256',
+    'SIGNING_KEY': os.environ['JWT_SECRET'],
+}
+
+# urls.py
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
+
+urlpatterns = [
+    path('api/token/', TokenObtainPairView.as_view()),
+    path('api/token/refresh/', TokenRefreshView.as_view()),
+]
+
+# views.py
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import IsAuthenticated
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def profile(request):
+    # request.user is automatically populated from JWT
+    return Response({'user_id': request.user.id})
+```
+
+### Flask (Flask-Login, Flask-JWT-Extended)
+
+**Flask-Login (Session-based)**:
+```python
+from flask import Flask
+from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
+import bcrypt
+
+app = Flask(__name__)
+app.secret_key = os.environ['FLASK_SECRET_KEY']
+
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'login'
+
+class User(UserMixin):
+    def __init__(self, id, username):
+        self.id = id
+        self.username = username
+
+@login_manager.user_loader
+def load_user(user_id):
+    user_data = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    if user_data:
+        return User(user_data['id'], user_data['username'])
+    return None
+
+@app.route('/login', methods=['POST'])
+def login():
+    username = request.form['username']
+    password = request.form['password']
+    
+    user_data = db.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    if user_data and bcrypt.checkpw(password.encode(), user_data['password_hash']):
+        user = User(user_data['id'], user_data['username'])
+        login_user(user)
+        return redirect('/dashboard')
+    
+    return render_template('login.html', error='Invalid credentials')
+
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    # current_user is automatically available
+    return render_template('dashboard.html', user=current_user)
+
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    return redirect('/login')
+```
+
+**Flask-JWT-Extended (Token-based)**:
+```python
+from flask import Flask, jsonify, request
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+import bcrypt
+
+app = Flask(__name__)
+app.config['JWT_SECRET_KEY'] = os.environ['JWT_SECRET']
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=24)
+
+jwt = JWTManager(app)
+
+@app.route('/api/login', methods=['POST'])
+def login():
+    username = request.json['username']
+    password = request.json['password']
+    
+    user_data = db.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    if user_data and bcrypt.checkpw(password.encode(), user_data['password_hash']):
+        access_token = create_access_token(identity=user_data['id'])
+        return jsonify({'access_token': access_token})
+    
+    return jsonify({'error': 'Invalid credentials'}), 401
+
+@app.route('/api/profile')
+@jwt_required()
+def profile():
+    user_id = get_jwt_identity()
+    user = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    return jsonify({'user': dict(user)})
+```
+
+### Next.js (NextAuth.js, API Routes)
+
+**NextAuth.js (Recommended)**:
+```javascript
+// pages/api/auth/[...nextauth].js
+import NextAuth from 'next-auth';
+import CredentialsProvider from 'next-auth/providers/credentials';
+import bcrypt from 'bcrypt';
+
+export default NextAuth({
+  providers: [
+    CredentialsProvider({
+      name: 'Credentials',
+      credentials: {
+        username: { label: "Username", type: "text" },
+        password: { label: "Password", type: "password" }
+      },
+      async authorize(credentials) {
+        const user = await db.getUserByUsername(credentials.username);
+        
+        if (user && await bcrypt.compare(credentials.password, user.password_hash)) {
+          return { id: user.id, name: user.username, email: user.email };
+        }
+        return null;
+      }
+    })
+  ],
+  session: {
+    strategy: 'jwt',
+    maxAge: 24 * 60 * 60, // 24 hours
+  },
+  jwt: {
+    secret: process.env.JWT_SECRET,
+  },
+  pages: {
+    signIn: '/login',
+  },
+});
+
+// pages/api/profile.js
+import { getServerSession } from 'next-auth/next';
+import { authOptions } from './auth/[...nextauth]';
+
+export default async function handler(req, res) {
+  const session = await getServerSession(req, res, authOptions);
+  
+  if (!session) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  
+  const user = await db.getUser(session.user.id);
+  res.json({ user });
+}
+
+// pages/dashboard.js
+import { useSession, signIn } from 'next-auth/react';
+
+export default function Dashboard() {
+  const { data: session, status } = useSession();
+  
+  if (status === 'loading') return <div>Loading...</div>;
+  if (status === 'unauthenticated') {
+    signIn();
+    return null;
+  }
+  
+  return <div>Welcome {session.user.name}</div>;
+}
+```
+
+### Express (Passport.js, express-session)
+
+**Passport.js with Local Strategy**:
+```javascript
+const express = require('express');
+const session = require('express-session');
+const passport = require('passport');
+const LocalStrategy = require('passport-local').Strategy;
+const bcrypt = require('bcrypt');
+
+const app = express();
+
+app.use(session({
+  secret: process.env.SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    secure: true, // HTTPS only
+    httpOnly: true,
+    maxAge: 24 * 60 * 60 * 1000, // 24 hours
+    sameSite: 'lax',
+  },
+}));
+
+app.use(passport.initialize());
+app.use(passport.session());
+
+passport.use(new LocalStrategy(
+  async (username, password, done) => {
+    try {
+      const user = await db.getUserByUsername(username);
+      if (!user) {
+        return done(null, false, { message: 'Invalid credentials' });
+      }
+      
+      const isValid = await bcrypt.compare(password, user.password_hash);
+      if (!isValid) {
+        return done(null, false, { message: 'Invalid credentials' });
+      }
+      
+      return done(null, user);
+    } catch (error) {
+      return done(error);
+    }
+  }
+));
+
+passport.serializeUser((user, done) => {
+  done(null, user.id);
+});
+
+passport.deserializeUser(async (id, done) => {
+  try {
+    const user = await db.getUserById(id);
+    done(null, user);
+  } catch (error) {
+    done(error);
+  }
+});
+
+app.post('/login', passport.authenticate('local'), (req, res) => {
+  res.json({ message: 'Logged in successfully' });
+});
+
+app.get('/profile', (req, res) => {
+  if (!req.isAuthenticated()) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  res.json({ user: req.user });
+});
+
+app.post('/logout', (req, res) => {
+  req.logout((err) => {
+    if (err) return res.status(500).json({ error: 'Logout failed' });
+    res.json({ message: 'Logged out successfully' });
+  });
+});
+```
+
 ## Detection Checklist
 
 - [ ] JWT tokens are verified with signature checking

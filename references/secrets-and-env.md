@@ -572,6 +572,384 @@ except Exception as e:
 - [ ] Secrets are rotated regularly
 - [ ] Access to secrets is logged and audited
 
+## Quick Fix Patterns
+
+### Pattern 1: Hardcoded API Key → Environment Variable
+
+**Detection**: Search for `sk-`, `AKIA`, API key patterns in source files
+
+**Fix (diff format)**:
+```diff
+- OPENAI_API_KEY = "sk-proj-abc123xyz..."
++ import os
++ OPENAI_API_KEY = os.environ['OPENAI_API_KEY']
+```
+
+**Manual steps**:
+1. Move the secret value to `.env` file: `OPENAI_API_KEY=sk-proj-abc123xyz...`
+2. Add `.env` to `.gitignore` if not already present
+3. Replace hardcoded value with `os.environ['OPENAI_API_KEY']` (Python) or `process.env.OPENAI_API_KEY` (JavaScript)
+4. Rotate the exposed secret immediately
+5. Audit git history: `git log -p | grep "sk-proj-"`
+
+### Pattern 2: Client-Side Secret → Server-Side Only
+
+**Detection**: Search for `NEXT_PUBLIC_`, `VITE_`, `REACT_APP_`, `EXPO_PUBLIC_` with secret values
+
+**Fix (diff format)**:
+```diff
+# .env
+- NEXT_PUBLIC_STRIPE_SECRET_KEY=sk_live_51ABC...
++ STRIPE_SECRET_KEY=sk_live_51ABC...
++ NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY=pk_live_51ABC...
+```
+
+```diff
+// pages/api/payment.js (NEW FILE - server-side)
++ import Stripe from 'stripe';
++ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
++ 
++ export default async function handler(req, res) {
++   const paymentIntent = await stripe.paymentIntents.create({
++     amount: req.body.amount,
++     currency: 'usd',
++   });
++   res.json({ clientSecret: paymentIntent.client_secret });
++ }
+```
+
+```diff
+// pages/checkout.js (client-side)
+- const stripe = new Stripe(process.env.NEXT_PUBLIC_STRIPE_SECRET_KEY);
++ const createPayment = async (amount) => {
++   const response = await fetch('/api/payment', {
++     method: 'POST',
++     headers: { 'Content-Type': 'application/json' },
++     body: JSON.stringify({ amount }),
++   });
++   return response.json();
++ };
+```
+
+**Manual steps**:
+1. Remove `NEXT_PUBLIC_` prefix from secret environment variable
+2. Create API route/endpoint for server-side secret usage
+3. Update client code to call the API route instead of using secret directly
+4. Rotate the exposed secret
+5. Rebuild and redeploy application to remove secret from client bundle
+
+### Pattern 3: .env Not in .gitignore → Add to .gitignore
+
+**Detection**: Check if `.env` file exists but not in `.gitignore`
+
+**Fix (diff format)**:
+```diff
+# .gitignore
++ # Environment variables and secrets
++ .env
++ .env.local
++ .env.*.local
++ .env.production
++ .env.development
++ *.pem
++ *.key
++ secrets.json
++ credentials.json
+```
+
+**Manual steps**:
+1. Add `.env` and related patterns to `.gitignore`
+2. Check if `.env` was already committed: `git log --all --full-history -- .env`
+3. If committed, remove from git: `git rm --cached .env`
+4. Commit the .gitignore change: `git add .gitignore && git commit -m "Add .env to .gitignore"`
+5. If .env was in history, clean history (see Pattern 4)
+
+### Pattern 4: Secret in Git History → BFG Cleanup
+
+**Detection**: `git log -p | grep -E "sk-[a-zA-Z0-9]{32,}|AKIA[0-9A-Z]{16}"`
+
+**Manual steps**:
+1. **FIRST**: Rotate the exposed secret immediately (old secret is compromised)
+2. Install BFG Repo-Cleaner: `brew install bfg` or download from https://rtyley.github.io/bfg-repo-cleaner/
+3. Create passwords.txt with patterns to remove:
+   ```
+   sk-proj-abc123xyz...
+   AKIA1234567890ABCDEF
+   ```
+4. Clone a fresh bare copy: `git clone --mirror https://github.com/user/repo.git`
+5. Run BFG: `bfg --replace-text passwords.txt repo.git`
+6. Clean up: `cd repo.git && git reflog expire --expire=now --all && git gc --prune=now --aggressive`
+7. Force push: `git push --force`
+8. Notify team to re-clone: All team members must delete local copies and re-clone
+9. Verify secret is gone: `git log -p | grep "sk-proj-"`
+
+## Framework-Specific Guidance
+
+### Python (Django, Flask, FastAPI)
+
+**Django**:
+```python
+# settings.py - CORRECT
+import os
+from pathlib import Path
+
+SECRET_KEY = os.environ['DJANGO_SECRET_KEY']
+DEBUG = os.environ.get('DEBUG', 'False') == 'True'
+
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': os.environ['DB_NAME'],
+        'USER': os.environ['DB_USER'],
+        'PASSWORD': os.environ['DB_PASSWORD'],
+        'HOST': os.environ['DB_HOST'],
+        'PORT': os.environ.get('DB_PORT', '5432'),
+    }
+}
+
+# Third-party API keys
+OPENAI_API_KEY = os.environ['OPENAI_API_KEY']
+STRIPE_SECRET_KEY = os.environ['STRIPE_SECRET_KEY']
+```
+
+**Flask**:
+```python
+# config.py - CORRECT
+import os
+
+class Config:
+    SECRET_KEY = os.environ['FLASK_SECRET_KEY']
+    SQLALCHEMY_DATABASE_URI = os.environ['DATABASE_URL']
+    OPENAI_API_KEY = os.environ['OPENAI_API_KEY']
+    
+    @staticmethod
+    def init_app(app):
+        # Validate required env vars at startup
+        required = ['FLASK_SECRET_KEY', 'DATABASE_URL', 'OPENAI_API_KEY']
+        missing = [var for var in required if not os.environ.get(var)]
+        if missing:
+            raise ValueError(f"Missing required env vars: {missing}")
+
+# app.py
+from flask import Flask
+from config import Config
+
+app = Flask(__name__)
+app.config.from_object(Config)
+Config.init_app(app)
+```
+
+**FastAPI**:
+```python
+# config.py - CORRECT
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    database_url: str
+    openai_api_key: str
+    stripe_secret_key: str
+    jwt_secret: str
+    
+    class Config:
+        env_file = '.env'
+        case_sensitive = False
+
+settings = Settings()
+
+# app.py
+from fastapi import FastAPI
+from config import settings
+
+app = FastAPI()
+
+@app.get("/")
+async def root():
+    # Use settings.openai_api_key, never hardcode
+    return {"status": "ok"}
+```
+
+### JavaScript/TypeScript (Next.js, React, Express)
+
+**Next.js**:
+```javascript
+// next.config.js - CORRECT
+module.exports = {
+  env: {
+    // Only non-sensitive public values
+    NEXT_PUBLIC_API_URL: process.env.NEXT_PUBLIC_API_URL,
+  },
+  // Server-side secrets stay in process.env, never exposed
+};
+
+// pages/api/openai.js - Server-side API route
+import OpenAI from 'openai';
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY, // Server-side only
+});
+
+export default async function handler(req, res) {
+  const completion = await openai.chat.completions.create({
+    model: 'gpt-4',
+    messages: req.body.messages,
+  });
+  res.json(completion);
+}
+
+// pages/chat.js - Client-side
+export default function Chat() {
+  const sendMessage = async (message) => {
+    // Call API route, not OpenAI directly
+    const response = await fetch('/api/openai', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages: [{ role: 'user', content: message }] }),
+    });
+    return response.json();
+  };
+}
+```
+
+**React (Vite)**:
+```javascript
+// vite.config.js - CORRECT
+export default {
+  define: {
+    // Only non-sensitive public values
+    'import.meta.env.VITE_API_URL': JSON.stringify(process.env.VITE_API_URL),
+  },
+};
+
+// src/config.js
+export const config = {
+  apiUrl: import.meta.env.VITE_API_URL, // Public
+  // Never put secrets here - use backend API
+};
+
+// src/api/client.js
+export async function callSecureAPI(endpoint, data) {
+  // Backend handles secrets
+  return fetch(`${config.apiUrl}${endpoint}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+}
+```
+
+**Express**:
+```javascript
+// config.js - CORRECT
+require('dotenv').config();
+
+const requiredEnvVars = [
+  'DATABASE_URL',
+  'JWT_SECRET',
+  'OPENAI_API_KEY',
+  'STRIPE_SECRET_KEY',
+];
+
+requiredEnvVars.forEach((varName) => {
+  if (!process.env[varName]) {
+    throw new Error(`Missing required environment variable: ${varName}`);
+  }
+});
+
+module.exports = {
+  databaseUrl: process.env.DATABASE_URL,
+  jwtSecret: process.env.JWT_SECRET,
+  openaiApiKey: process.env.OPENAI_API_KEY,
+  stripeSecretKey: process.env.STRIPE_SECRET_KEY,
+  port: process.env.PORT || 3000,
+};
+
+// app.js
+const express = require('express');
+const config = require('./config');
+
+const app = express();
+
+app.post('/api/payment', async (req, res) => {
+  const stripe = require('stripe')(config.stripeSecretKey);
+  // Use config.stripeSecretKey, never hardcode
+});
+```
+
+### Mobile (React Native, Expo)
+
+**React Native with Expo**:
+```javascript
+// app.config.js - CORRECT
+export default {
+  expo: {
+    name: 'MyApp',
+    extra: {
+      // Only non-sensitive public values
+      apiUrl: process.env.EXPO_PUBLIC_API_URL,
+      // NEVER put secrets here - they end up in the app bundle
+    },
+  },
+};
+
+// src/config.js
+import Constants from 'expo-constants';
+
+export const config = {
+  apiUrl: Constants.expoConfig.extra.apiUrl,
+  // All secrets must be on backend
+};
+
+// src/api/client.js
+import * as SecureStore from 'expo-secure-store';
+
+export async function callSecureAPI(endpoint, data) {
+  // Get user token from secure storage
+  const token = await SecureStore.getItemAsync('userToken');
+  
+  // Backend handles API keys and secrets
+  return fetch(`${config.apiUrl}${endpoint}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`,
+    },
+    body: JSON.stringify(data),
+  });
+}
+
+// Store sensitive tokens securely
+export async function storeToken(token) {
+  await SecureStore.setItemAsync('userToken', token);
+}
+```
+
+**React Native (bare)**:
+```javascript
+// Use react-native-config for environment variables
+// .env
+API_URL=https://api.example.com
+// NO secrets here - they're in the app bundle
+
+// src/config.js
+import Config from 'react-native-config';
+
+export const config = {
+  apiUrl: Config.API_URL, // Public only
+};
+
+// Use react-native-keychain for secure storage
+import * as Keychain from 'react-native-keychain';
+
+export async function storeCredentials(username, password) {
+  await Keychain.setGenericPassword(username, password);
+}
+
+export async function getCredentials() {
+  const credentials = await Keychain.getGenericPassword();
+  return credentials;
+}
+```
+
 ## Secure Secrets Management
 
 ### Development Environment
